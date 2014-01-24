@@ -60,6 +60,12 @@ Eigen::Matrix3d toEigen(urdf::Rotation q, double epsilon = 1e-16)
   return R;
 }
 
+// Whether the given link is virtual (e.g. "base_link" or "NP")
+bool isVirtual (boost::shared_ptr<const urdf::Link> link)
+{
+  return !(link->inertial);
+}
+
 // LinkComparer: for use with std::sort.
 class LinkComparer
 {
@@ -126,42 +132,57 @@ Status addSubTree(
   // convert the joint
   boost::shared_ptr<urdf::Joint> jnt = root->parent_joint;
   unsigned int metapod_joint_type;
-  switch (jnt->type) {
-    case urdf::Joint::REVOLUTE:
-    case urdf::Joint::CONTINUOUS: {
-      if (prefer_fixed_axis &&
-          jnt->axis.x == 1. && jnt->axis.y == 0. && jnt->axis.z == 0.) {
-        logInform("Adding joint '%s' as a REVOLUTE_AXIS_X joint",
-                  jnt->name.c_str());
-        metapod_joint_type = metapod::RobotBuilder::REVOLUTE_AXIS_X;
-      } else if (prefer_fixed_axis &&
-                 jnt->axis.x == 0. && jnt->axis.y == 1. && jnt->axis.z == 0.) {
-        logInform("Adding joint '%s' as a REVOLUTE_AXIS_Y joint",
-                  jnt->name.c_str());
-        metapod_joint_type = metapod::RobotBuilder::REVOLUTE_AXIS_Y;
-      } else if (prefer_fixed_axis &&
-                 jnt->axis.x == 0. && jnt->axis.y == 0. && jnt->axis.z == 1.) {
-        logInform("Adding joint '%s' as a REVOLUTE_AXIS_Z joint",
-                  jnt->name.c_str());
-        metapod_joint_type = metapod::RobotBuilder::REVOLUTE_AXIS_Z;
-      } else {
-        logInform("Adding joint '%s' as a REVOLUTE_AXIS_ANY joint",
-                  jnt->name.c_str());
-        metapod_joint_type = metapod::RobotBuilder::REVOLUTE_AXIS_ANY;
+
+  if (jnt) {
+      switch (jnt->type) {
+        case urdf::Joint::REVOLUTE:
+        case urdf::Joint::CONTINUOUS: {
+          if (prefer_fixed_axis &&
+              jnt->axis.x == 1. && jnt->axis.y == 0. && jnt->axis.z == 0.) {
+            logInform("Adding joint '%s' as a REVOLUTE_AXIS_X joint",
+                      jnt->name.c_str());
+            metapod_joint_type = metapod::RobotBuilder::REVOLUTE_AXIS_X;
+          } else if (prefer_fixed_axis &&
+                     jnt->axis.x == 0. && jnt->axis.y == 1. && jnt->axis.z == 0.) {
+            logInform("Adding joint '%s' as a REVOLUTE_AXIS_Y joint",
+                      jnt->name.c_str());
+            metapod_joint_type = metapod::RobotBuilder::REVOLUTE_AXIS_Y;
+          } else if (prefer_fixed_axis &&
+                     jnt->axis.x == 0. && jnt->axis.y == 0. && jnt->axis.z == 1.) {
+            logInform("Adding joint '%s' as a REVOLUTE_AXIS_Z joint",
+                      jnt->name.c_str());
+            metapod_joint_type = metapod::RobotBuilder::REVOLUTE_AXIS_Z;
+          } else {
+            logInform("Adding joint '%s' as a REVOLUTE_AXIS_ANY joint",
+                      jnt->name.c_str());
+            metapod_joint_type = metapod::RobotBuilder::REVOLUTE_AXIS_ANY;
+          }
+          break;
+        }
+        case urdf::Joint::FLOATING: {
+          metapod_joint_type = metapod::RobotBuilder::FREE_FLYER;
+          logInform("Adding joint '%s' as a FREE_FLYER joint", jnt->name.c_str());
+          break;
+        }
+        default: {
+          logError("Joint '%s' is of unknown type", jnt->name.c_str());
+          return STATUS_FAILURE;
+          break;
+        }
       }
-      break;
-    }
-    case urdf::Joint::FLOATING: {
-      metapod_joint_type = metapod::RobotBuilder::FREE_FLYER;
-      logInform("Adding joint '%s' as a FREE_FLYER joint", jnt->name.c_str());
-      break;
-    }
-    default: {
-      logError("Joint '%s' is of unknown type", jnt->name.c_str());
-      return STATUS_FAILURE;
-      break;
-    }
   }
+  else // special case: no parent joint for root, choose default free-flyer
+  {
+      jnt = boost::shared_ptr<urdf::Joint> (new urdf::Joint ());
+      jnt->name = "FREE_FLYER";
+      jnt->parent_to_joint_origin_transform.rotation.clear ();
+      jnt->parent_to_joint_origin_transform.position.clear ();
+      jnt->axis.clear ();
+      metapod_joint_type = metapod::RobotBuilder::FREE_FLYER;
+      logInform("Adding parent joint '%s' for root link '%s'",
+                jnt->name.c_str(), root->name.c_str());
+  }
+
   // constructs the optional inertia
   double mass = 1.;
   Eigen::Vector3d center_of_mass = Eigen::Vector3d::Zero();
@@ -218,20 +239,37 @@ Status treeFromUrdfModel(const urdf::ModelInterface& robot_model,
                          const LinkComparer& link_comparer,
                          bool prefer_fixed_axis,
                          const std::map<std::string, int>& joint_dof_index) {
+  Status status;
+
   //  add all children
   const bool has_parent = false;
-  for (size_t i=0; i<robot_model.getRoot()->child_links.size(); ++i) {
-    // TODO: what happens when there are two robots?
-    Status status = addSubTree(builder, link_comparer,
-                               robot_model.getRoot()->child_links[i],
-                               std::string("GROUND"),
-                               prefer_fixed_axis,
-                               joint_dof_index,
-                               has_parent);
-    if (status == STATUS_FAILURE)
-      return STATUS_FAILURE;
+
+  // if the root link is virtual (e.g. "base_link" or "NP")
+  if (isVirtual(robot_model.getRoot())) {
+    for (size_t i=0; i<robot_model.getRoot()->child_links.size(); ++i) {
+      // TODO: what happens when there are two robots?
+      status = addSubTree(builder, link_comparer,
+                          robot_model.getRoot()->child_links[i],
+                          std::string("GROUND"),
+                          prefer_fixed_axis,
+                          joint_dof_index,
+                          has_parent);
+      if (status == STATUS_FAILURE)
+        return STATUS_FAILURE;
+    }
   }
-  return STATUS_SUCCESS;
+  else // root link is an actual link
+  {
+    // TODO: what happens when there are two robots?
+    status = addSubTree(builder, link_comparer,
+                        robot_model.getRoot(),
+                        std::string("GROUND"),
+                        prefer_fixed_axis,
+                        joint_dof_index,
+                        has_parent);
+  }
+
+  return status;
 }
 
 namespace po = boost::program_options;
